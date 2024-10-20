@@ -3,3 +3,7 @@ asyncio
 colorama
 SQLAlchemy
 psycopg2
+aiohttp
+bs4
+langchain
+langchain-community

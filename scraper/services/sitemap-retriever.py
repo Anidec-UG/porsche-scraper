@@ -3,7 +3,7 @@ from playwright.async_api import async_playwright
 from urllib.parse import urlparse, urlunparse, urljoin
 import xml.etree.ElementTree as ET
 import re
-from colorama import Fore, Back, Style
+from colorama import Fore
 import colorama
 from sqlalchemy import create_engine, Column, Integer, String, func, exists
 from sqlalchemy.ext.declarative import declarative_base
