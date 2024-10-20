@@ -2,3 +2,4 @@ playwright
 asyncio
 colorama
 SQLAlchemy
+psycopg2
