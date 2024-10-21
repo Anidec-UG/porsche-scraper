@@ -7,3 +7,6 @@ aiohttp
 bs4
 langchain
 langchain-community
+ollama
+chromadb
+langchain-chroma

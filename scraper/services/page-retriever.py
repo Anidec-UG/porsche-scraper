@@ -1,16 +1,25 @@
 import asyncio
 import aiohttp
-from bs4 import BeautifulSoup
 from sqlalchemy import create_engine, Column, Integer, String, select
+from bs4 import BeautifulSoup
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker
-from concurrent.futures import ThreadPoolExecutor
+import ollama
+from langchain_chroma import Chroma
 from langchain.text_splitter import RecursiveCharacterTextSplitter
-from langchain.embeddings import LlamaCppEmbeddings
-from langchain.vectorstores import Chroma
-from langchain.document_loaders import TextLoader
+from langchain.embeddings.base import Embeddings
 
 Base = declarative_base()
+
+class OllamaEmbedding(Embeddings):
+    def embed_documents(self, texts):
+        return [generate_ollama_embedding(text) for text in texts]
+
+    def embed_query(self, text):
+        return generate_ollama_embedding(text)
+
+ollama_embeddings = OllamaEmbedding()
+chroma_db = Chroma(embedding_function=ollama_embeddings, collection_name="scraped_content", persist_directory="./chroma_db")
 
 class ScrapedUrl(Base):
     __tablename__ = 'scraped_urls'
@@ -19,6 +28,24 @@ class ScrapedUrl(Base):
 
 engine = create_engine('postgresql://postgres:postgres@localhost:5432/scraper')
 Session = sessionmaker(bind=engine)
+
+def split_text(content):
+    splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
+    return splitter.split_text(content)
+
+def create_documents_from_content(content, url):
+    text_chunks = split_text(content)
+    documents = [{"page_content": chunk, "metadata": {"source": url}} for chunk in text_chunks]
+    return documents
+
+def generate_ollama_embedding(text):
+    try:
+        response = ollama.embed(text)  
+        return response["embedding"]  
+    except Exception as e:
+        print(f"Error generating embedding: {str(e)}")
+        return None
+
 
 def get_all_urls():
     session = Session()
@@ -30,84 +57,69 @@ def get_all_urls():
     finally:
         session.close()
 
+def parse_text(content):
+    soup = BeautifulSoup(content, 'html.parser')
+    for scripts_or_style in soup(['script', 'style', 'nav', 'footer', 'header']):
+        scripts_or_style.decompose()
+    text = soup.get_text(separator=' ')
+    cleaned_text = ' '.join(text.split())
+    return cleaned_text
+
+stored_documents = []
+
 async def scrape_content(url, session):
     try:
         async with session.get(url) as response:
             if response.status == 200:
-                html = await response.text()
-                soup = BeautifulSoup(html, 'html.parser')
+                content = await response.text()
+                parsed_content = parse_text(content)
                 
-                for element in soup(['script', 'style', 'nav', 'footer', 'header']):
-                    element.decompose()
-                
-                text = soup.get_text(separator='\n', strip=True)
-                
-                cleaned_text = '\n'.join(line for line in text.splitlines() if line.strip())
-                
-                print(f"Scraped content for {url}:")
-                print(cleaned_text[:500] + "..." if len(cleaned_text) > 500 else cleaned_text)
-                print("\n" + "="*50 + "\n")
-                
-                return cleaned_text
+                documents = create_documents_from_content(parsed_content, url)
+
+                for doc in documents:
+                    embedding = generate_ollama_embedding(doc["page_content"])
+                    if embedding is not None:
+                        chroma_db.add_texts(texts=[doc["page_content"]], embeddings=[embedding], metadatas=[doc["metadata"]])
+                        stored_documents.append(doc) 
+
+                print(f"Successfully scraped and embedded content from {url}")
+                return parsed_content
             else:
                 print(f"Failed to scrape {url}. Status code: {response.status}")
                 return None
     except Exception as e:
         print(f"Error scraping {url}: {str(e)}")
         return None
-
+    
 async def scrape_urls(urls):
     async with aiohttp.ClientSession() as session:
         tasks = [scrape_content(url, session) for url in urls]
-        return await asyncio.gather(*tasks)
+        try:
+            return await asyncio.gather(*tasks)
+        except Exception as e:
+            print(f"Error in scraping tasks: {str(e)}")
 
-def run_scraper(urls):
-    return asyncio.run(scrape_urls(urls))
 
-def process_scraped_content(scraped_contents):
-    text_splitter = RecursiveCharacterTextSplitter(
-        chunk_size=1000,
-        chunk_overlap=200,
-        length_function=len,
-    )
+def query_chroma_db(query):
+    results = chroma_db.similarity_search(query, k=5)  
     
-    chunks = text_splitter.create_documents(scraped_contents)
+    for result in results:
+        print(f"Source: {result['metadata']['source']}")
+        print(f"Content: {result['page_content']}\n")
     
-    embeddings = LlamaCppEmbeddings(
-        model_path="ollama/llama2",
-        n_ctx=2048,
-        n_threads=4,
-    )
-    
-    vectorstore = Chroma.from_documents(chunks, embeddings)
-    
-    return vectorstore
+    return results
 
 def main():
     urls = get_all_urls()
-    print(f"Found URLs: {len(urls)}")
-    
-    num_threads = min(32, len(urls))
-    
-    chunk_size = len(urls) // num_threads
-    url_chunks = [urls[i:i + chunk_size] for i in range(0, len(urls), chunk_size)]
-    
-    with ThreadPoolExecutor(max_workers=num_threads) as executor:
-        scraped_contents = list(executor.map(run_scraper, url_chunks))
-    
-    all_scraped_contents = [content for chunk in scraped_contents for content in chunk if content]
-    
-    vectorstore = process_scraped_content(all_scraped_contents)
-    
-    print("Vector store created successfully.")
-    
-    query = "What is machine learning?"
-    results = vectorstore.similarity_search(query)
-    
-    print(f"Results for query '{query}':")
-    for doc in results:
-        print(doc.page_content)
-        print("---")
+    if urls:
+        asyncio.run(scrape_urls(urls))
+        chroma_db.persist()  
+        print("Scraping completed and data persisted.")
+    else:
+        print("No URLs found.")
+
+    for doc in stored_documents:
+        print(f"Source: {doc['metadata']['source']}, Content: {doc['page_content']}")
 
 if __name__ == "__main__":
     main()
